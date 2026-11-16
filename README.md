@@ -77,6 +77,46 @@ The 6.0 s is the first corpus listing of a process — `listSessions()` and
 `traceSession()` both pay it once, because listing reads every stored session
 header. The background warm-up moves that cost off the command.
 
+## When a family is slow: stale checkpoint formats
+
+The checkpoint tier only answers for a session whose stored checkpoint matches
+its **current format version**. `SessionProjectionCache.cachedSnapshot` rejects a
+record whose `formatVersion` differs from the listed header's:
+
+```js
+function currentLifecycleMatches(stored, expected) {
+  return stored.formatVersion === expected.formatVersion && …
+}
+```
+
+A predecessor tolerance exists (`predecessorIdentityMatches`) but is deliberately
+limited to the title projection: format normalization can change what the other
+projections mean, so their predecessor records are not served. A session written
+before a format migration therefore has an unusable checkpoint and takes the log
+replay path.
+
+Measured on a 733-session family in which 315 children still carried
+pre-migration checkpoints:
+
+| Work | Time |
+|---|---|
+| `/usage` end to end | 210 s |
+| 417 checkpoint hits | 20 ms total |
+| 315 log replays | ~470 ms each |
+
+A replay is CPU-bound, so raising the concurrency does not help: the same 12
+sessions took 5.66 s serially, 5.60 s at 8 in flight, and 5.37 s at 16. Most of
+each replay is validation and deep cloning rather than decompression — the same
+15.5 MB log costs 240 ms to decompress and parse directly
+(`zstdDecompressSync` 77 ms, line split 70 ms, `JSON.parse` 93 ms) against
+1,416 ms through `readSession`.
+
+This plugin does not bypass that. Reading the storage files directly would trade
+the replay guarantee — validated, format-translated events — for speed, and a
+later format change could then produce silently wrong totals. The cure is
+current checkpoints: opening a session once makes DSH rewrite its checkpoint in
+the current format, after which the row costs microseconds.
+
 ## What the columns mean
 
 | Column | Meaning |
